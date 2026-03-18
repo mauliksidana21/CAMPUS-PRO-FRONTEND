@@ -2,29 +2,93 @@ import { useState, useEffect } from "react";
 
 export default function Home() {
   const [page, setPage] = useState("login");
-  const [cookie, setCookie] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [showPopup, setShowPopup] = useState(false);
   const [activeNav, setActiveNav] = useState("home");
   const [attendance, setAttendance] = useState([]);
   const [marks, setMarks] = useState([]);
   const [timetable, setTimetable] = useState([]);
   const [courses, setCourses] = useState([]);
   const [dataLoading, setDataLoading] = useState(false);
-  const [step, setStep] = useState(1);
+  const [userEmail, setUserEmail] = useState("");
 
   useEffect(() => {
     const saved = localStorage.getItem("srm_cookie");
+    const savedEmail = localStorage.getItem("srm_email");
     if (saved) {
       setCookie(saved);
+      setUserEmail(savedEmail || "");
       setPage("app");
       loadAllData(saved);
     }
   }, []);
 
+  const [cookie, setCookie] = useState("");
+
+  // Listen for cookie from popup
+  useEffect(() => {
+    function handleMessage(e) {
+      if (e.data?.type === "SRM_COOKIE") {
+        const c = e.data.cookie;
+        localStorage.setItem("srm_cookie", c);
+        localStorage.setItem("srm_email", email);
+        setCookie(c);
+        setUserEmail(email);
+        setShowPopup(false);
+        setPage("app");
+        loadAllData(c);
+      }
+    }
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [email]);
+
+  async function doLogin() {
+    if (!email.trim() || !password.trim()) {
+      setError("Email aur password daalo!");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account: email, password }),
+      });
+      const data = await res.json();
+      if (data.authenticated) {
+        const tok = data.lookup?.digest;
+        localStorage.setItem("srm_token", tok);
+        localStorage.setItem("srm_email", email);
+        setUserEmail(email);
+        setPage("app");
+        await loadAllData(tok);
+      } else if (data.error?.includes("CAPTCHA") || data.session?.code?.includes("CAPTCHA") || !data.authenticated) {
+        // Show popup for manual CAPTCHA
+        setShowPopup(true);
+      } else {
+        setError("Invalid credentials. Try again.");
+      }
+    } catch (e) {
+      setError("Server error. Try again.");
+    }
+    setLoading(false);
+  }
+
   async function fetchAcademia(type, cookieVal) {
     const res = await fetch(`/api/academia?type=${type}`, {
       headers: { "x-cookie": cookieVal },
+    });
+    return res.json();
+  }
+
+  async function fetchWithToken(endpoint, token) {
+    const res = await fetch(`/api/${endpoint}`, {
+      headers: { "x-token": token },
     });
     return res.json();
   }
@@ -38,7 +102,9 @@ export default function Home() {
     );
   }
 
-  function parseAttendance(html) {
+  function parseAttendance(input) {
+    // Handle both HTML string and API response object
+    let html = typeof input === "string" ? input : input?.html || "";
     try {
       const decoded = decodeHex(html);
       const parser = new DOMParser();
@@ -60,7 +126,7 @@ export default function Home() {
           if (cells[0] && cells[0].toLowerCase() !== "null") {
             result.push({
               courseCode: code.replace("Regular", "").trim(),
-              courseTitle: cells[0].split("–")[0].split("\\u2013")[0].trim(),
+              courseTitle: cells[0].split("–")[0].trim(),
               facultyName: cells[2] || "",
               slot: cells[3] || "",
               hoursConducted: conducted,
@@ -70,13 +136,29 @@ export default function Home() {
           }
         }
       });
+      // If parsed from HTML, return result
+      if (result.length > 0) return result;
+      // Fallback: try as goscraper API response
+      const apiData = typeof input === "object" ? input : null;
+      if (apiData?.attendance) {
+        return apiData.attendance.map((a) => ({
+          courseCode: a.courseCode || "",
+          courseTitle: a.courseTitle || "",
+          facultyName: a.facultyName || "",
+          slot: a.slot || "",
+          hoursConducted: parseFloat(a.hoursConducted) || 0,
+          hoursAbsent: parseFloat(a.hoursAbsent) || 0,
+          attendancePercentage: a.attendancePercentage || "0",
+        }));
+      }
       return result;
     } catch (e) {
       return [];
     }
   }
 
-  function parseTimetable(html) {
+  function parseTimetable(input) {
+    let html = typeof input === "string" ? input : input?.html || "";
     try {
       const decoded = decodeHex(html);
       const parser = new DOMParser();
@@ -101,13 +183,18 @@ export default function Home() {
           }
         }
       });
+      if (result.length > 0) return result;
+      // Fallback goscraper
+      const apiData = typeof input === "object" ? input : null;
+      if (apiData?.schedule) return apiData.schedule;
       return result;
     } catch (e) {
       return [];
     }
   }
 
-  function parseMarks(html) {
+  function parseMarks(input) {
+    let html = typeof input === "string" ? input : input?.html || "";
     try {
       const decoded = decodeHex(html);
       const parser = new DOMParser();
@@ -128,67 +215,61 @@ export default function Home() {
           }
         }
       });
+      if (result.length > 0) return result;
+      const apiData = typeof input === "object" ? input : null;
+      if (apiData?.marks) {
+        return apiData.marks.map((m) => ({
+          courseCode: m.courseCode || "",
+          courseType: m.courseType || "",
+          tests: m.testPerformance?.map((t) => `${t.test}: ${t.marks?.scored}/${t.marks?.total}`) || [],
+        }));
+      }
       return result;
     } catch (e) {
       return [];
     }
   }
 
-  async function loadAllData(cookieVal) {
+  async function loadAllData(tokenOrCookie) {
     setDataLoading(true);
     try {
-      const [attData, ttData, marksData] = await Promise.all([
-        fetchAcademia("attendance", cookieVal),
-        fetchAcademia("timetable", cookieVal),
-        fetchAcademia("marks", cookieVal),
-      ]);
-      const att = parseAttendance(attData.html || "");
-      setAttendance(att);
-      setTimetable(parseTimetable(ttData.html || ""));
-      setMarks(parseMarks(marksData.html || ""));
-      setCourses(att.map((a) => ({
-        courseTitle: a.courseTitle,
-        courseCode: a.courseCode,
-        facultyName: a.facultyName,
-        credit: 3,
-      })));
+      // Try cookie-based first
+      const isCookie = tokenOrCookie.includes("=") && tokenOrCookie.length > 100;
+      if (isCookie) {
+        const [attData, ttData, marksData] = await Promise.all([
+          fetchAcademia("attendance", tokenOrCookie),
+          fetchAcademia("timetable", tokenOrCookie),
+          fetchAcademia("marks", tokenOrCookie),
+        ]);
+        const att = parseAttendance(attData);
+        setAttendance(att);
+        setTimetable(parseTimetable(ttData));
+        setMarks(parseMarks(marksData));
+        setCourses(att.map((a) => ({ courseTitle: a.courseTitle, courseCode: a.courseCode, facultyName: a.facultyName, credit: 3 })));
+      } else {
+        // Token based (goscraper)
+        const [attData, marksData, ttData] = await Promise.all([
+          fetchWithToken("attendance", tokenOrCookie),
+          fetchWithToken("marks", tokenOrCookie),
+          fetchWithToken("timetable", tokenOrCookie),
+        ]);
+        const att = parseAttendance(attData);
+        setAttendance(att);
+        setTimetable(parseTimetable(ttData));
+        setMarks(parseMarks(marksData));
+        setCourses(att.map((a) => ({ courseTitle: a.courseTitle, courseCode: a.courseCode, facultyName: a.facultyName, credit: 3 })));
+      }
     } catch (e) {
       console.error(e);
     }
     setDataLoading(false);
   }
 
-  async function doLogin() {
-    if (!cookie.trim()) {
-      setError("Cookie paste karo!");
-      return;
-    }
-    setLoading(true);
-    setError("");
-    try {
-      const data = await fetchAcademia("attendance", cookie.trim());
-      if (data.html && data.html.length > 500) {
-        localStorage.setItem("srm_cookie", cookie.trim());
-        setPage("app");
-        await loadAllData(cookie.trim());
-      } else {
-        setError("Cookie invalid ya expire ho gayi. Dobara copy karo.");
-      }
-    } catch (e) {
-      setError("Connection error. Try again.");
-    }
-    setLoading(false);
-  }
-
   function doLogout() {
     localStorage.clear();
-    setCookie("");
-    setAttendance([]);
-    setMarks([]);
-    setTimetable([]);
-    setCourses([]);
+    setEmail(""); setPassword(""); setCookie("");
+    setAttendance([]); setMarks([]); setTimetable([]); setCourses([]);
     setPage("login");
-    setStep(1);
   }
 
   const avgAtt = attendance.length > 0
@@ -198,89 +279,81 @@ export default function Home() {
   if (page === "login") {
     return (
       <div style={S.loginBg}>
+        {/* CAPTCHA Popup */}
+        {showPopup && (
+          <div style={S.popupOverlay}>
+            <div style={S.popupCard}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: "#e8edf8" }}>Complete Login on Academia</div>
+                <button onClick={() => setShowPopup(false)} style={{ background: "transparent", border: "none", color: "#8a9bc4", fontSize: 20, cursor: "pointer" }}>×</button>
+              </div>
+              <div style={{ fontSize: 12, color: "#8a9bc4", marginBottom: 12 }}>
+                1. CAPTCHA solve karo → Login karo<br />
+                2. Login hone ke baad yeh window band ho jaayegi automatically<br />
+                3. Agar band na ho toh neeche button dabao
+              </div>
+              <iframe
+                src={`https://academia.srmist.edu.in/accounts/p/40-10002227248/signin/v2/lookup/${email}`}
+                style={{ width: "100%", height: 500, border: "none", borderRadius: 10 }}
+                title="SRM Login"
+              />
+              <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+                <button
+                  style={{ ...S.loginBtn, background: "#00c97a" }}
+                  onClick={() => {
+                    // Try to grab cookie after manual login
+                    const c = localStorage.getItem("srm_cookie_from_iframe") || "";
+                    if (c) {
+                      localStorage.setItem("srm_cookie", c);
+                      setPage("app");
+                      loadAllData(c);
+                      setShowPopup(false);
+                    } else {
+                      // Ask user to copy cookie manually
+                      setShowPopup(false);
+                      alert("Login ho gaya! Ab F12 → Console → document.cookie copy karo aur refresh karo.");
+                    }
+                  }}
+                >
+                  Login Ho Gaya ✓
+                </button>
+                <button onClick={() => setShowPopup(false)} style={{ ...S.loginBtn, background: "transparent", border: "1px solid #1e2d4d", color: "#8a9bc4" }}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div style={S.loginCard}>
           <div style={S.badge}>★ SRM University Portal</div>
-          <h1 style={{ fontSize: 26, fontWeight: 700, color: "#e8edf8", margin: "0 0 4px" }}>
+          <h1 style={{ fontSize: 28, fontWeight: 700, color: "#e8edf8", margin: "0 0 6px" }}>
             Campus<span style={{ color: "#e8192c" }}>Pro.</span>
           </h1>
-          <p style={{ fontSize: 13, color: "#8a9bc4", marginBottom: 24 }}>
-            Sign in with your SRM Academia session
+          <p style={{ fontSize: 13, color: "#8a9bc4", marginBottom: 28 }}>
+            Sign in to access your academic dashboard
           </p>
-
-          {/* Steps */}
-          <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
-            {[1, 2, 3].map((s) => (
-              <div key={s} style={{ flex: 1, height: 3, borderRadius: 2, background: step >= s ? "#1a6cf0" : "#1e2d4d" }} />
-            ))}
+          {error && <div style={S.errorBox}>{error}</div>}
+          <label style={S.fieldLabel}>SRM Email</label>
+          <input
+            style={S.inputField}
+            placeholder="ms5215@srmist.edu.in"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+          <label style={S.fieldLabel}>Password</label>
+          <input
+            type="password"
+            style={S.inputField}
+            placeholder="Enter your password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && doLogin()}
+          />
+          <button style={S.loginBtn} onClick={doLogin} disabled={loading}>
+            {loading ? "Signing in..." : "Sign In →"}
+          </button>
+          <div style={{ marginTop: 14, fontSize: 11, color: "#8a9bc4", textAlign: "center" }}>
+            🔒 Your credentials are secure
           </div>
-
-          {step === 1 && (
-            <div>
-              <div style={S.stepBox}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: "#e8edf8", marginBottom: 12 }}>
-                  Step 1 — Academia pe login karo
-                </div>
-                <div style={{ fontSize: 12, color: "#b0bdd8", lineHeight: 1.8 }}>
-                  1. <a href="https://academia.srmist.edu.in" target="_blank" rel="noreferrer" style={{ color: "#5b9bff" }}>academia.srmist.edu.in</a> kholo<br />
-                  2. Apne SRM email aur password se login karo<br />
-                  3. Login hone ke baad wapas aao
-                </div>
-              </div>
-              <button style={S.loginBtn} onClick={() => setStep(2)}>
-                Login kar liya → Next
-              </button>
-            </div>
-          )}
-
-          {step === 2 && (
-            <div>
-              <div style={S.stepBox}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: "#e8edf8", marginBottom: 12 }}>
-                  Step 2 — Cookie copy karo
-                </div>
-                <div style={{ fontSize: 12, color: "#b0bdd8", lineHeight: 1.8 }}>
-                  1. Academia tab pe jaao<br />
-                  2. <kbd style={{ background: "#1e2d4d", padding: "1px 6px", borderRadius: 4, color: "#e8edf8" }}>F12</kbd> dabao → <strong style={{ color: "#e8edf8" }}>Console</strong> tab<br />
-                  3. Neeche box mein type karo:
-                </div>
-                <div style={{ background: "#060d1a", border: "1px solid #1a6cf0", borderRadius: 8, padding: "10px 14px", margin: "10px 0", fontFamily: "monospace", fontSize: 13, color: "#5b9bff", userSelect: "all" }}>
-                  document.cookie
-                </div>
-                <div style={{ fontSize: 12, color: "#b0bdd8" }}>
-                  4. Enter dabao → Jo text aaye woh <strong style={{ color: "#e8edf8" }}>poora select karke copy</strong> karo
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button style={{ ...S.loginBtn, background: "transparent", border: "1px solid #1e2d4d", color: "#8a9bc4", flex: 1 }} onClick={() => setStep(1)}>← Back</button>
-                <button style={{ ...S.loginBtn, flex: 2 }} onClick={() => setStep(3)}>Copy kar liya → Next</button>
-              </div>
-            </div>
-          )}
-
-          {step === 3 && (
-            <div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: "#e8edf8", marginBottom: 10 }}>
-                Step 3 — Cookie paste karo
-              </div>
-              {error && <div style={S.errorBox}>{error}</div>}
-              <textarea
-                style={S.cookieInput}
-                placeholder="_ga=GA1.3...; JSESSIONID=CC6DCD...; _zcsr_tmp=075aada..."
-                value={cookie}
-                onChange={(e) => setCookie(e.target.value)}
-                rows={5}
-              />
-              <div style={{ display: "flex", gap: 8 }}>
-                <button style={{ ...S.loginBtn, background: "transparent", border: "1px solid #1e2d4d", color: "#8a9bc4", flex: 1 }} onClick={() => setStep(2)}>← Back</button>
-                <button style={{ ...S.loginBtn, flex: 2 }} onClick={doLogin} disabled={loading}>
-                  {loading ? "Connecting..." : "Login →"}
-                </button>
-              </div>
-              <div style={{ marginTop: 12, fontSize: 11, color: "#8a9bc4", textAlign: "center" }}>
-                🔒 Cookie sirf tumhare browser mein store hoti hai
-              </div>
-            </div>
-          )}
         </div>
       </div>
     );
@@ -295,10 +368,12 @@ export default function Home() {
           </span>
         </div>
         <div style={{ margin: "14px 18px 10px", background: "#111d35", border: "1px solid #1e2d4d", borderRadius: 10, padding: "10px 12px", display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 34, height: 34, background: "#1a6cf0", borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 600, color: "#fff" }}>SR</div>
+          <div style={{ width: 34, height: 34, background: "#1a6cf0", borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 600, color: "#fff" }}>
+            {userEmail.slice(0, 2).toUpperCase() || "SR"}
+          </div>
           <div>
-            <div style={{ fontSize: 12, fontWeight: 500, color: "#e8edf8" }}>SRM Student</div>
-            <div style={{ fontSize: 11, color: "#8a9bc4" }}>Academia Portal</div>
+            <div style={{ fontSize: 12, fontWeight: 500, color: "#e8edf8", maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{userEmail || "SRM Student"}</div>
+            <div style={{ fontSize: 11, color: "#8a9bc4" }}>SRM Student</div>
           </div>
         </div>
         <nav style={{ padding: "8px 10px", flex: 1 }}>
@@ -333,10 +408,11 @@ export default function Home() {
                 <div style={{ fontSize: 20, fontWeight: 700, color: "#e8edf8" }}>
                   {new Date().getHours() < 12 ? "Good Morning! 🌅" : new Date().getHours() < 17 ? "Good Afternoon! ☀️" : "Good Evening! 🌙"}
                 </div>
-                <div style={{ fontSize: 13, color: "#8a9bc4", marginTop: 4 }}>SRM Academia · {new Date().toLocaleDateString("en-IN", { weekday: "long" })}</div>
+                <div style={{ fontSize: 13, color: "#8a9bc4", marginTop: 4 }}>{userEmail} · SRM Student</div>
               </div>
               <div style={{ textAlign: "right" }}>
                 <div style={{ fontSize: 18, fontWeight: 700, color: "#e8edf8" }}>{new Date().toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })}</div>
+                <div style={{ fontSize: 12, color: "#8a9bc4" }}>{new Date().toLocaleDateString("en-IN", { weekday: "long" })}</div>
               </div>
             </div>
             <div style={S.statGrid}>
@@ -344,7 +420,7 @@ export default function Home() {
                 { label: "Total Subjects", val: attendance.length || "—", color: "#5b9bff" },
                 { label: "Below 75%", val: attendance.filter(a => parseFloat(a.attendancePercentage) < 75).length, color: "#e8192c" },
                 { label: "Avg Attendance", val: avgAtt ? avgAtt + "%" : "—", color: "#00c97a" },
-                { label: "Marks Loaded", val: marks.length || "—", color: "#f5c842" },
+                { label: "Marks Entries", val: marks.length || "—", color: "#f5c842" },
               ].map((c, i) => (
                 <div key={i} style={S.statCard}>
                   <div style={S.statLabel}>{c.label}</div>
@@ -385,9 +461,10 @@ export default function Home() {
                 {timetable.map((day, i) => (
                   <div key={i} style={{ background: "#0e1726", border: "1px solid #1e2d4d", borderRadius: 12, padding: "12px 10px" }}>
                     <div style={{ fontSize: 10, color: "#8a9bc4", textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 8, fontWeight: 600 }}>{day.day}</div>
-                    {day.classes.map((c, j) => (
+                    {(day.classes || []).map((c, j) => (
                       <div key={j} style={{ background: "#111d35", borderLeft: "3px solid #1a6cf0", borderRadius: 6, padding: "7px 8px", marginBottom: 5 }}>
-                        <div style={{ fontSize: 11, fontWeight: 500, color: "#e8edf8" }}>{c.name}</div>
+                        <div style={{ fontSize: 11, fontWeight: 500, color: "#e8edf8" }}>{c.courseTitle || c.name}</div>
+                        {(c.startTime || c.roomNo) && <div style={{ fontSize: 10, color: "#5b9bff" }}>{c.startTime ? `${c.startTime}–${c.endTime}` : c.roomNo}</div>}
                       </div>
                     ))}
                   </div>
@@ -449,12 +526,24 @@ export default function Home() {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                 {marks.map((m, i) => (
                   <div key={i} style={{ background: "#0e1726", border: "1px solid #1e2d4d", borderRadius: 14, padding: 18 }}>
-                    <div style={S.attSubject}>{m.courseCode}</div>
-                    <div style={S.attCode}>{m.courseType}</div>
+                    <div style={S.attSubject}>{m.courseName || m.courseCode}</div>
+                    <div style={S.attCode}>{m.courseCode} · {m.courseType}</div>
+                    {m.overall?.scored && (
+                      <div style={{ marginTop: 8, display: "flex", justifyContent: "space-between" }}>
+                        <span style={{ fontSize: 12, color: "#8a9bc4" }}>Overall</span>
+                        <span style={{ fontSize: 18, fontWeight: 700, color: "#5b9bff" }}>{m.overall.scored}/{m.overall.total}</span>
+                      </div>
+                    )}
                     {m.tests?.map((t, j) => (
                       <div key={j} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #1e2d4d", fontSize: 12 }}>
                         <span style={{ color: "#8a9bc4" }}>Test {j + 1}</span>
                         <span style={{ fontWeight: 500, color: "#e8edf8" }}>{t}</span>
+                      </div>
+                    ))}
+                    {m.testPerformance?.map((t, j) => (
+                      <div key={j} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #1e2d4d", fontSize: 12 }}>
+                        <span style={{ color: "#8a9bc4" }}>{t.test}</span>
+                        <span style={{ fontWeight: 500, color: "#e8edf8" }}>{t.marks?.scored}/{t.marks?.total}</span>
                       </div>
                     ))}
                   </div>
@@ -475,17 +564,20 @@ export default function Home() {
                 <div key={i} style={{ background: "#0e1726", border: "1px solid #1e2d4d", borderRadius: 14, padding: "18px 20px", marginBottom: 10 }}>
                   <div style={{ display: "flex", justifyContent: "space-between" }}>
                     <div>
-                      <div style={S.attSubject}>{c.courseTitle}</div>
+                      <div style={S.attSubject}>{c.courseTitle || c.courseName}</div>
                       <div style={S.attCode}>{c.courseCode}</div>
                     </div>
-                    <div style={{ background: "#0d1f3c", color: "#5b9bff", fontSize: 11, padding: "3px 10px", borderRadius: 20, height: "fit-content" }}>3 Credits</div>
+                    <div style={{ background: "#0d1f3c", color: "#5b9bff", fontSize: 11, padding: "3px 10px", borderRadius: 20, height: "fit-content" }}>{c.credit || 3} Credits</div>
                   </div>
                   {c.facultyName && (
                     <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", background: "#111d35", borderRadius: 8, marginTop: 8 }}>
                       <div style={{ width: 30, height: 30, borderRadius: "50%", background: "#1a6cf0", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 600, color: "#fff" }}>
                         {c.facultyName.slice(0, 2).toUpperCase()}
                       </div>
-                      <div style={{ fontSize: 13, color: "#e8edf8" }}>{c.facultyName}</div>
+                      <div>
+                        <div style={{ fontSize: 13, color: "#e8edf8", fontWeight: 500 }}>{c.facultyName}</div>
+                        {c.facultyEmail && <div style={{ fontSize: 11, color: "#8a9bc4" }}>{c.facultyEmail}</div>}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -503,9 +595,7 @@ export default function Home() {
 
 function GPACalc({ subjects }) {
   const gp = { O: 10, "A+": 9, A: 8, "B+": 7, B: 6, C: 5, F: 0 };
-  const list = subjects.length > 0 ? subjects : [
-    { courseTitle: "Subject 1" }, { courseTitle: "Subject 2" }, { courseTitle: "Subject 3" },
-  ];
+  const list = subjects.length > 0 ? subjects : [{ courseTitle: "Subject 1" }, { courseTitle: "Subject 2" }, { courseTitle: "Subject 3" }];
   const [grades, setGrades] = useState({});
   const [credits, setCredits] = useState({});
   const tc = list.reduce((s, _, i) => s + (parseInt(credits[i]) || 3), 0);
@@ -514,13 +604,11 @@ function GPACalc({ subjects }) {
   return (
     <div style={S.content}>
       <div style={S.pageTitle}>GPA Calculator</div>
-      <div style={S.pageSub}>Grade change karo — live GPA update hoga</div>
+      <div style={S.pageSub}>Grade change karo — live update hoga</div>
       <div style={{ background: "#0e1726", border: "1px solid #1e2d4d", borderRadius: 14, overflow: "hidden", marginBottom: 16 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr style={{ background: "#111d35" }}>
-            {["Subject", "Credits", "Grade", "Points"].map(h => (
-              <th key={h} style={{ padding: "10px 14px", fontSize: 11, color: "#8a9bc4", textAlign: "left", textTransform: "uppercase" }}>{h}</th>
-            ))}
+            {["Subject", "Credits", "Grade", "Points"].map(h => <th key={h} style={{ padding: "10px 14px", fontSize: 11, color: "#8a9bc4", textAlign: "left", textTransform: "uppercase" }}>{h}</th>)}
           </tr></thead>
           <tbody>
             {list.map((c, i) => (
@@ -602,12 +690,14 @@ function Predictor({ attendance }) {
 
 const S = {
   loginBg: { minHeight: "100vh", background: "#0a0f1e", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 },
-  loginCard: { background: "#0e1726", border: "1px solid #1e2d4d", borderRadius: 20, padding: "36px 32px", width: "100%", maxWidth: 440 },
+  loginCard: { background: "#0e1726", border: "1px solid #1e2d4d", borderRadius: 20, padding: "40px 36px", width: "100%", maxWidth: 420 },
   badge: { display: "inline-block", background: "#0d1f3c", border: "1px solid #1a6cf0", borderRadius: 20, padding: "5px 14px", fontSize: 12, color: "#5b9bff", marginBottom: 20 },
-  stepBox: { background: "#060d1a", border: "1px solid #1e2d4d", borderRadius: 10, padding: "14px 16px", marginBottom: 16 },
-  cookieInput: { width: "100%", background: "#111d35", border: "1px solid #1e2d4d", borderRadius: 10, padding: "11px 14px", color: "#e8edf8", fontSize: 12, marginBottom: 14, outline: "none", resize: "vertical", fontFamily: "monospace", boxSizing: "border-box" },
-  loginBtn: { width: "100%", background: "#1a6cf0", border: "none", borderRadius: 10, padding: 12, color: "#fff", fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
-  errorBox: { background: "#1a0a0e", border: "1px solid #e8192c", color: "#ff7080", borderRadius: 8, padding: "9px 12px", fontSize: 12, marginBottom: 12 },
+  fieldLabel: { fontSize: 12, color: "#8a9bc4", marginBottom: 6, display: "block", fontWeight: 500 },
+  inputField: { width: "100%", background: "#111d35", border: "1px solid #1e2d4d", borderRadius: 10, padding: "12px 14px", color: "#e8edf8", fontSize: 14, marginBottom: 16, outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
+  loginBtn: { width: "100%", background: "#1a6cf0", border: "none", borderRadius: 10, padding: 13, color: "#fff", fontSize: 15, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
+  errorBox: { background: "#1a0a0e", border: "1px solid #e8192c", color: "#ff7080", borderRadius: 8, padding: "9px 12px", fontSize: 12, marginBottom: 16 },
+  popupOverlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 },
+  popupCard: { background: "#0e1726", border: "1px solid #1e2d4d", borderRadius: 16, padding: 20, width: "100%", maxWidth: 600 },
   appWrap: { display: "flex", minHeight: "100vh", background: "#0a0f1e" },
   sidebar: { width: 220, background: "#0d1528", borderRight: "1px solid #1e2d4d", display: "flex", flexDirection: "column", position: "sticky", top: 0, height: "100vh" },
   navItem: { display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: 8, cursor: "pointer", color: "#b0bdd8", fontSize: 13, marginBottom: 2 },
