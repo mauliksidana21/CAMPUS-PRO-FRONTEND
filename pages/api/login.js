@@ -1,18 +1,14 @@
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).end()
-  const { account, password } = req.body
+  if (req.method !== 'POST') return res.status(405).end();
   try {
     const response = await fetch('http://localhost:8080/login', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-CSRF-Token': 'undefined',
-      },
-      body: JSON.stringify({ account, password })
-    })
-    const data = await response.json()
-    res.status(200).json(data)
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+    });
+    const data = await response.json();
+    res.status(response.status).json(data);
   } catch (e) {
-    res.status(500).json({ error: e.message })
+    res.status(500).json({ error: 'Backend unreachable' });
   }
 }
