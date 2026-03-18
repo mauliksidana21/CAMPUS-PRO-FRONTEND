@@ -2,7 +2,7 @@
 export default async function handler(req, res) {
   const token = req.headers['x-token']
   try {
-    const r = await fetch('http://localhost:8080/attendance', {
+    const r = await fetch('https://campus-pro-backend-1.onrender.com/attendance', {
       headers: { 'X-CSRF-Token': 'undefined', 'token': token }
     })
     res.status(200).json(await r.json())
